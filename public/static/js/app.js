@@ -199,7 +199,7 @@ async function getSession(category) {
   if (sessionCache[category]) return sessionCache[category];
   const ort = await ensureOrt();
   const path = MODEL_PATHS[category];
-  const session = await ort.InferenceSession.create(path, { executionProviders: ['wasm'] });
+  const session = await ort.InferenceSession.create(path, { executionProviders: ['webgl', 'wasm'] });
   sessionCache[category] = session;
   return session;
 }
@@ -214,12 +214,29 @@ function isDefectLabel(label) {
   return name.includes('defect') || name.includes('bad') || name.includes('fault');
 }
 
+function getImageSize(image) {
+  if (image instanceof HTMLVideoElement) {
+    return { width: image.videoWidth || MODEL_INPUT_SIZE, height: image.videoHeight || MODEL_INPUT_SIZE };
+  }
+  return { width: image.naturalWidth || image.width || MODEL_INPUT_SIZE, height: image.naturalHeight || image.height || MODEL_INPUT_SIZE };
+}
+
 function prepareInput(image) {
   const canvas = document.createElement('canvas');
   canvas.width = MODEL_INPUT_SIZE;
   canvas.height = MODEL_INPUT_SIZE;
   const ctx = canvas.getContext('2d');
-  ctx.drawImage(image, 0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
+  ctx.fillStyle = 'rgb(114,114,114)';
+  ctx.fillRect(0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
+
+  const { width, height } = getImageSize(image);
+  const scale = Math.min(MODEL_INPUT_SIZE / width, MODEL_INPUT_SIZE / height);
+  const newW = Math.round(width * scale);
+  const newH = Math.round(height * scale);
+  const dx = Math.floor((MODEL_INPUT_SIZE - newW) / 2);
+  const dy = Math.floor((MODEL_INPUT_SIZE - newH) / 2);
+  ctx.drawImage(image, 0, 0, width, height, dx, dy, newW, newH);
+
   const imgData = ctx.getImageData(0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
   const { data } = imgData;
   const floatData = new Float32Array(3 * MODEL_INPUT_SIZE * MODEL_INPUT_SIZE);
@@ -234,6 +251,10 @@ function prepareInput(image) {
     floatData[p++] = data[i + 2] / 255.0;
   }
   return { canvas, input: floatData };
+}
+
+function sigmoid(x) {
+  return 1 / (1 + Math.exp(-x));
 }
 
 function parseOutput(output, conf) {
@@ -259,12 +280,28 @@ function parseOutput(output, conf) {
       h = data[off + 3];
       score = data[off + 4];
     }
-    if (score < conf) continue;
-    const x1 = x - w / 2;
-    const y1 = y - h / 2;
-    const x2 = x + w / 2;
-    const y2 = y + h / 2;
-    boxes.push({ x1, y1, x2, y2, score });
+    let confScore = score;
+    if (confScore < 0 || confScore > 1) {
+      confScore = sigmoid(confScore);
+    }
+    if (confScore < conf) continue;
+    let bx = x;
+    let by = y;
+    let bw = w;
+    let bh = h;
+    if (Math.max(Math.abs(x), Math.abs(y), Math.abs(w), Math.abs(h)) <= 1.5) {
+      bx = x * MODEL_INPUT_SIZE;
+      by = y * MODEL_INPUT_SIZE;
+      bw = w * MODEL_INPUT_SIZE;
+      bh = h * MODEL_INPUT_SIZE;
+    }
+    if (!Number.isFinite(bx) || !Number.isFinite(by) || !Number.isFinite(bw) || !Number.isFinite(bh)) continue;
+    if (bw <= 1 || bh <= 1) continue;
+    const x1 = bx - bw / 2;
+    const y1 = by - bh / 2;
+    const x2 = bx + bw / 2;
+    const y2 = by + bh / 2;
+    boxes.push({ x1, y1, x2, y2, score: confScore });
   }
   return boxes;
 }
@@ -539,8 +576,8 @@ function renderLiveChart() {
 }
 
 function getThresholdSettings() {
-  const conf = confidenceSlider ? Number(confidenceSlider.value || 50) / 100 : null;
-  const iou = overlapSlider ? Number(overlapSlider.value || 50) / 100 : null;
+  const conf = confidenceSlider ? Number(confidenceSlider.value || 50) / 100 : 0.25;
+  const iou = overlapSlider ? Number(overlapSlider.value || 50) / 100 : 0.45;
   const labelMode = labelModeSelect ? labelModeSelect.value : 'confidence';
   return { conf, iou, labelMode };
 }
@@ -735,7 +772,7 @@ async function startLive() {
     if (!liveVideo) return;
     let result;
     try {
-      result = await runDetectionOnImage(liveVideo, selectedCategory, thresholds.conf || 0.35, thresholds.iou || 0.45);
+      result = await runDetectionOnImage(liveVideo, selectedCategory, thresholds.conf, thresholds.iou);
     } catch (err) {
       console.warn('Live detection failed:', err);
       return;
@@ -837,7 +874,7 @@ detectImageBtn.addEventListener('click', async () => {
   const img = new Image();
   img.src = URL.createObjectURL(file);
   await img.decode();
-  const result = await runDetectionOnImage(img, selectedCategory, thresholds.conf || 0.35, thresholds.iou || 0.45);
+  const result = await runDetectionOnImage(img, selectedCategory, thresholds.conf, thresholds.iou);
   systemStatus.textContent = 'Idle';
   await applyDetectionResult(result, selectedCategory, expected);
 });
@@ -859,7 +896,7 @@ detectVideoBtn.addEventListener('click', async () => {
   await new Promise(resolve => {
     video.onseeked = () => resolve();
   });
-  const result = await runDetectionOnImage(video, selectedCategory, thresholds.conf || 0.35, thresholds.iou || 0.45);
+  const result = await runDetectionOnImage(video, selectedCategory, thresholds.conf, thresholds.iou);
   systemStatus.textContent = 'Idle';
   await applyDetectionResult(result, selectedCategory, expected);
 });
@@ -876,7 +913,7 @@ function handleUploadFile(file) {
   const img = new Image();
   img.src = URL.createObjectURL(file);
   img.onload = async () => {
-    const result = await runDetectionOnImage(img, selectedCategory, thresholds.conf || 0.35, thresholds.iou || 0.45);
+    const result = await runDetectionOnImage(img, selectedCategory, thresholds.conf, thresholds.iou);
     systemStatus.textContent = 'Idle';
     uploadStatus.textContent = 'Done';
     await applyDetectionResult(result, selectedCategory, expected);
@@ -944,7 +981,7 @@ detectImageUrlBtn.addEventListener('click', async () => {
     const img = new Image();
     img.src = URL.createObjectURL(blob);
     await img.decode();
-    const result = await runDetectionOnImage(img, selectedCategory, thresholds.conf || 0.35, thresholds.iou || 0.45);
+    const result = await runDetectionOnImage(img, selectedCategory, thresholds.conf, thresholds.iou);
     systemStatus.textContent = 'Idle';
     await applyDetectionResult(result, selectedCategory, expected);
   } catch {
