@@ -99,7 +99,7 @@
                 <div class="preview-text">Upload image/video or use live camera.</div>
               </div>
               <div class="preview-corner" id="previewCorner">Idle</div>
-              <img id="liveFeedDashboard" class="preview-media hidden" alt="Live Feed" />
+              <video id="liveFeedDashboard" class="preview-media hidden" autoplay muted playsinline></video>
               <img id="imagePreview" class="preview-media hidden" alt="Detection Preview" />
               <video id="videoPreview" class="preview-media hidden" controls></video>
             </div>
@@ -154,7 +154,7 @@
       <section class="panel" id="panel-live">
         <div class="panel-title">Live Camera Detection</div>
         <div class="preview">
-          <img id="liveFeed" class="preview-media" alt="Live Feed" />
+          <video id="liveFeed" class="preview-media" autoplay muted playsinline></video>
         </div>
         <div class="controls">
           <button id="startCamera" class="primary">Start Camera</button>

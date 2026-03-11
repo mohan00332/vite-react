@@ -492,6 +492,30 @@ function showLivePreview() {
   liveFeedDashboard.classList.remove('hidden');
 }
 
+function attachStreamToPreview(stream) {
+  [liveFeed, liveFeedDashboard].forEach(el => {
+    if (!el) return;
+    if (el instanceof HTMLVideoElement) {
+      el.srcObject = stream;
+      el.muted = true;
+      el.play().catch(() => {});
+    }
+  });
+}
+
+function clearLivePreview() {
+  [liveFeed, liveFeedDashboard].forEach(el => {
+    if (!el) return;
+    if (el instanceof HTMLVideoElement) {
+      el.pause();
+      el.srcObject = null;
+      el.removeAttribute('src');
+    } else {
+      el.src = '';
+    }
+  });
+}
+
 function renderLiveChart() {
   if (!liveChart) return;
   liveChart.innerHTML = '';
@@ -683,6 +707,10 @@ async function startLive() {
     alert('Live camera is not supported in this build.');
     return;
   }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    alert('Camera API is not available in this browser.');
+    return;
+  }
   systemStatus.textContent = 'Live';
   liveSeries.length = 0;
   renderLiveChart();
@@ -691,14 +719,27 @@ async function startLive() {
   if (liveStream) {
     liveStream.getTracks().forEach(t => t.stop());
   }
-  liveStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+  try {
+    liveStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+  } catch (err) {
+    systemStatus.textContent = 'Idle';
+    alert('Camera access was blocked. Please allow camera permission in the browser.');
+    return;
+  }
   liveVideo = document.createElement('video');
   liveVideo.srcObject = liveStream;
   await liveVideo.play();
+  attachStreamToPreview(liveStream);
   showLivePreview();
   liveTimer = setInterval(async () => {
     if (!liveVideo) return;
-    const result = await runDetectionOnImage(liveVideo, selectedCategory, thresholds.conf || 0.35, thresholds.iou || 0.45);
+    let result;
+    try {
+      result = await runDetectionOnImage(liveVideo, selectedCategory, thresholds.conf || 0.35, thresholds.iou || 0.45);
+    } catch (err) {
+      console.warn('Live detection failed:', err);
+      return;
+    }
     const expected = Number(expectedInput.value || 0);
     const defect = result.defect;
     const detected = result.detected;
@@ -739,8 +780,8 @@ async function startLive() {
     if (liveSeries.length > 60) liveSeries.shift();
     renderLiveChart();
     if (result.outputUrl) {
-      liveFeed.src = result.outputUrl;
-      liveFeedDashboard.src = result.outputUrl;
+      if (liveFeed && liveFeed.tagName === 'IMG') liveFeed.src = result.outputUrl;
+      if (liveFeedDashboard && liveFeedDashboard.tagName === 'IMG') liveFeedDashboard.src = result.outputUrl;
     }
   }, 900);
   isLive = true;
@@ -761,8 +802,7 @@ async function stopLive() {
     liveVideo.srcObject = null;
     liveVideo = null;
   }
-  liveFeed.src = '';
-  liveFeedDashboard.src = '';
+  clearLivePreview();
   if (liveFeedDashboard) liveFeedDashboard.classList.add('hidden');
   isLive = false;
   await refreshTotals();
