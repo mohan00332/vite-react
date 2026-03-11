@@ -6,11 +6,12 @@
   <title>Manufacturing Defect Detection Dashboard</title>
   <link rel="stylesheet" href="/static/css/styles.css" />
   <script>
-    window.API_BASE = '/api';
+    window.API_BASE = '';
     window.LIVE_SUPPORTED = true;
     window.REPORTS_SUPPORTED = true;
-    window.SUPABASE_URL = '';
-    window.SUPABASE_ANON_KEY = '';
+    window.CLIENT_INFERENCE = true;
+    window.SUPABASE_URL = 'https://ehivvwzedwgaatbujfes.supabase.co';
+    window.SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVoaXZ2d3plZHdnYWF0YnVqZmVzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMyMDg2MDIsImV4cCI6MjA4ODc4NDYwMn0.4moo190jLiB3z0CA6Dsp6ZusZkd3B0NFKVhJqSDbjtc';
   </script>
 </head>
 <body>
@@ -117,7 +118,7 @@
             <div class="sample-row" id="sampleRow">
               <div class="sample-empty">Loading samples...</div>
             </div>
-            <a class="stack-link" href="/api/samples-view" target="_blank">View Test Set ?</a>
+            <a class="stack-link" href="/samples.html" target="_blank">View Test Set ?</a>
           </div>
 
           <div class="stack-card">

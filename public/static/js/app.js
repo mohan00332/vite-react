@@ -77,6 +77,345 @@ const gearDefect = document.getElementById('gearDefect');
 const gearGood = document.getElementById('gearGood');
 const resetCategoryTotals = document.getElementById('resetCategoryTotals');
 
+const CLIENT_INFERENCE = window.CLIENT_INFERENCE === true;
+const MODEL_INPUT_SIZE = 640;
+const MODEL_DIR = '/models';
+const MODEL_PATHS = {
+  Nut: `${MODEL_DIR}/Nut.onnx`,
+  Bolt: `${MODEL_DIR}/Bolt.onnx`,
+  Gear: `${MODEL_DIR}/Gear.onnx`
+};
+const LABELS_URL = `${MODEL_DIR}/model_labels.json`;
+const LOCAL_STATS_KEY = 'md_stats_v1';
+const LOCAL_LOG_KEY = 'md_log_v1';
+let localStats = {
+  Nut: { detected: 0, defect: 0, good: 0 },
+  Bolt: { detected: 0, defect: 0, good: 0 },
+  Gear: { detected: 0, defect: 0, good: 0 }
+};
+let localMeta = { last_reset: null };
+let localLog = [];
+let labelsCache = null;
+const sessionCache = {};
+let liveStream = null;
+let liveVideo = null;
+let liveTimer = null;
+
+function todayIso() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function loadLocalState() {
+  try {
+    const statsRaw = localStorage.getItem(LOCAL_STATS_KEY);
+    if (statsRaw) {
+      const parsed = JSON.parse(statsRaw);
+      if (parsed && parsed.stats) {
+        localStats = parsed.stats;
+        localMeta = parsed.meta || localMeta;
+      }
+    }
+    const logRaw = localStorage.getItem(LOCAL_LOG_KEY);
+    if (logRaw) {
+      const parsedLog = JSON.parse(logRaw);
+      if (Array.isArray(parsedLog)) localLog = parsedLog;
+    }
+  } catch {
+    // ignore
+  }
+  maybeResetLocalStats();
+}
+
+function saveLocalState() {
+  try {
+    localStorage.setItem(LOCAL_STATS_KEY, JSON.stringify({ stats: localStats, meta: localMeta }));
+    localStorage.setItem(LOCAL_LOG_KEY, JSON.stringify(localLog.slice(-500)));
+  } catch {
+    // ignore
+  }
+}
+
+function maybeResetLocalStats() {
+  const today = todayIso();
+  if (localMeta.last_reset === today) return;
+  Object.keys(localStats).forEach(key => {
+    localStats[key] = { detected: 0, defect: 0, good: 0 };
+  });
+  localMeta.last_reset = today;
+  saveLocalState();
+}
+
+loadLocalState();
+
+function updateLocalStats(category, detected, defect, good) {
+  maybeResetLocalStats();
+  if (!localStats[category]) return;
+  localStats[category].detected += detected;
+  localStats[category].defect += defect;
+  localStats[category].good += good;
+  saveLocalState();
+}
+
+function updateLocalStatsMany(perCategory) {
+  Object.entries(perCategory).forEach(([cat, vals]) => {
+    updateLocalStats(cat, vals.detected, vals.defect, vals.good);
+  });
+}
+
+function appendLocalLog(entry) {
+  localLog.push(entry);
+  saveLocalState();
+}
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const tag = document.createElement('script');
+    tag.src = src;
+    tag.onload = () => resolve();
+    tag.onerror = () => reject(new Error(`Failed to load ${src}`));
+    document.head.appendChild(tag);
+  });
+}
+
+async function ensureOrt() {
+  if (window.ort) return window.ort;
+  await loadScript('https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js');
+  return window.ort;
+}
+
+async function loadLabels() {
+  if (labelsCache) return labelsCache;
+  try {
+    const res = await fetch(LABELS_URL);
+    if (!res.ok) return null;
+    labelsCache = await res.json();
+  } catch {
+    labelsCache = null;
+  }
+  return labelsCache;
+}
+
+async function getSession(category) {
+  if (sessionCache[category]) return sessionCache[category];
+  const ort = await ensureOrt();
+  const path = MODEL_PATHS[category];
+  const session = await ort.InferenceSession.create(path, { executionProviders: ['wasm'] });
+  sessionCache[category] = session;
+  return session;
+}
+
+function isDefectLabel(label) {
+  if (!label) return true;
+  const name = String(label).toLowerCase().trim();
+  if (name.includes('non_defect') || name.includes('non-defect') || name.includes('nondefect')) {
+    return false;
+  }
+  if (name.includes('gear_defect')) return true;
+  return name.includes('defect') || name.includes('bad') || name.includes('fault');
+}
+
+function prepareInput(image) {
+  const canvas = document.createElement('canvas');
+  canvas.width = MODEL_INPUT_SIZE;
+  canvas.height = MODEL_INPUT_SIZE;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(image, 0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
+  const imgData = ctx.getImageData(0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
+  const { data } = imgData;
+  const floatData = new Float32Array(3 * MODEL_INPUT_SIZE * MODEL_INPUT_SIZE);
+  let p = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    floatData[p++] = data[i] / 255.0;
+  }
+  for (let i = 0; i < data.length; i += 4) {
+    floatData[p++] = data[i + 1] / 255.0;
+  }
+  for (let i = 0; i < data.length; i += 4) {
+    floatData[p++] = data[i + 2] / 255.0;
+  }
+  return { canvas, input: floatData };
+}
+
+function parseOutput(output, conf) {
+  const { data, dims } = output;
+  if (!dims || dims.length !== 3) return [];
+  const channelsFirst = dims[1] < dims[2];
+  const channels = channelsFirst ? dims[1] : dims[2];
+  const num = channelsFirst ? dims[2] : dims[1];
+  const boxes = [];
+  for (let i = 0; i < num; i++) {
+    let x, y, w, h, score;
+    if (channelsFirst) {
+      x = data[i];
+      y = data[i + num];
+      w = data[i + num * 2];
+      h = data[i + num * 3];
+      score = data[i + num * 4];
+    } else {
+      const off = i * channels;
+      x = data[off];
+      y = data[off + 1];
+      w = data[off + 2];
+      h = data[off + 3];
+      score = data[off + 4];
+    }
+    if (score < conf) continue;
+    const x1 = x - w / 2;
+    const y1 = y - h / 2;
+    const x2 = x + w / 2;
+    const y2 = y + h / 2;
+    boxes.push({ x1, y1, x2, y2, score });
+  }
+  return boxes;
+}
+
+function iou(a, b) {
+  const x1 = Math.max(a.x1, b.x1);
+  const y1 = Math.max(a.y1, b.y1);
+  const x2 = Math.min(a.x2, b.x2);
+  const y2 = Math.min(a.y2, b.y2);
+  const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+  const areaA = Math.max(0, a.x2 - a.x1) * Math.max(0, a.y2 - a.y1);
+  const areaB = Math.max(0, b.x2 - b.x1) * Math.max(0, b.y2 - b.y1);
+  return inter / (areaA + areaB - inter + 1e-6);
+}
+
+function nms(boxes, iouThresh) {
+  const sorted = boxes.slice().sort((a, b) => b.score - a.score);
+  const keep = [];
+  while (sorted.length) {
+    const current = sorted.shift();
+    keep.push(current);
+    for (let i = sorted.length - 1; i >= 0; i--) {
+      if (iou(current, sorted[i]) > iouThresh) {
+        sorted.splice(i, 1);
+      }
+    }
+  }
+  return keep;
+}
+
+async function runSession(session, inputTensor, conf, iouThresh) {
+  const feeds = { [session.inputNames[0]]: inputTensor };
+  const results = await session.run(feeds);
+  const outputName = session.outputNames[0];
+  const output = results[outputName];
+  const raw = parseOutput(output, conf);
+  return nms(raw, iouThresh);
+}
+
+async function runDetectionOnImage(image, category, conf, iouThresh) {
+  const ort = await ensureOrt();
+  const { canvas, input } = prepareInput(image);
+  const inputTensor = new ort.Tensor('float32', input, [1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE]);
+  const labels = await loadLabels();
+  const ctx = canvas.getContext('2d');
+  const results = {
+    detected: 0,
+    defect: 0,
+    good: 0,
+    perCategory: null,
+    outputUrl: null
+  };
+
+  const drawBoxes = (boxes, label, color) => {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.fillStyle = color;
+    ctx.font = '14px sans-serif';
+    boxes.forEach(box => {
+      ctx.strokeRect(box.x1, box.y1, box.x2 - box.x1, box.y2 - box.y1);
+      const text = label ? `${label} ${(box.score * 100).toFixed(1)}%` : `${(box.score * 100).toFixed(1)}%`;
+      ctx.fillText(text, box.x1, Math.max(12, box.y1 - 4));
+    });
+  };
+
+  if (category === 'All') {
+    const perCategory = {};
+    for (const cat of Object.keys(MODEL_PATHS)) {
+      const session = await getSession(cat);
+      const boxes = await runSession(session, inputTensor, conf, iouThresh);
+      const label = labels && labels[cat] ? labels[cat][0] : 'defect';
+      drawBoxes(boxes, label, cat === 'Nut' ? '#ff6b6b' : cat === 'Bolt' ? '#3b82f6' : '#22c55e');
+      perCategory[cat] = { detected: boxes.length, defect: boxes.length, good: 0 };
+      results.detected += boxes.length;
+      results.defect += boxes.length;
+    }
+    results.perCategory = perCategory;
+  } else {
+    const session = await getSession(category);
+    const boxes = await runSession(session, inputTensor, conf, iouThresh);
+    const label = labels && labels[category] ? labels[category][0] : 'defect';
+    drawBoxes(boxes, label, '#ff6b6b');
+    results.detected = boxes.length;
+    results.defect = boxes.length;
+  }
+
+  results.outputUrl = canvas.toDataURL('image/jpeg', 0.92);
+  return results;
+}
+
+async function applyDetectionResult(result, category, expected) {
+  const defect = result.defect;
+  const detected = result.detected;
+  const good = expected > 0 ? Math.max(expected - defect, 0) : Math.max(detected - defect, 0);
+  if (result.perCategory) {
+    const perCategory = {};
+    Object.entries(result.perCategory).forEach(([cat, vals]) => {
+      const catGood = expected > 0 ? Math.max(expected - vals.defect, 0) : Math.max(vals.detected - vals.defect, 0);
+      perCategory[cat] = { detected: vals.detected, defect: vals.defect, good: catGood };
+    });
+    updateLocalStatsMany(perCategory);
+  } else {
+    updateLocalStats(category, detected, defect, good);
+  }
+  const now = new Date();
+  appendLocalLog({
+    date: now.toISOString().slice(0, 10),
+    time: now.toTimeString().slice(0, 8),
+    category,
+    expected_count: expected,
+    detected,
+    defect,
+    good
+  });
+  await logSupabase({
+    timestamp: now.toISOString(),
+    category,
+    expected_count: expected,
+    detected,
+    defect,
+    good
+  });
+  if (result.outputUrl) {
+    showPreviewImage(result.outputUrl);
+  }
+  updateCurrentStats(category, detected, defect, good, expected);
+  await refreshTotals();
+  setActivePanel('dashboard');
+}
+
+async function initSupabaseClient() {
+  if (!window.SUPABASE_URL || !window.SUPABASE_ANON_KEY) return;
+  try {
+    const { createClient } = await import('https://cdn.jsdelivr.net/npm/@supabase/supabase-js/+esm');
+    window.supabase = createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY, {
+      auth: { persistSession: false }
+    });
+  } catch {
+    // ignore
+  }
+}
+
+async function logSupabase(entry) {
+  if (!window.supabase) return;
+  try {
+    await window.supabase.from('detections').insert([entry]);
+  } catch {
+    // ignore
+  }
+}
+
 document.addEventListener('click', (event) => {
   const clickable = event.target.closest('button, .chip, .nav-item, .upload-btn, .stack-link');
   if (!clickable) return;
@@ -208,26 +547,25 @@ function updateCurrentStats(category, detected, defect, good, expected) {
 }
 
 async function refreshTotals() {
-  const res = await fetch(apiUrl('/stats'));
-  const data = await res.json();
-  if (!data.ok) return;
-  const stats = data.stats;
-  if (nutDetected) nutDetected.textContent = stats.Nut.detected;
-  if (nutDefect) nutDefect.textContent = stats.Nut.defect;
-  if (nutGood) nutGood.textContent = stats.Nut.good;
-  if (boltDetected) boltDetected.textContent = stats.Bolt.detected;
-  if (boltDefect) boltDefect.textContent = stats.Bolt.defect;
-  if (boltGood) boltGood.textContent = stats.Bolt.good;
-  if (gearDetected) gearDetected.textContent = stats.Gear.detected;
-  if (gearDefect) gearDefect.textContent = stats.Gear.defect;
-  if (gearGood) gearGood.textContent = stats.Gear.good;
+  maybeResetLocalStats();
+  if (nutDetected) nutDetected.textContent = localStats.Nut.detected;
+  if (nutDefect) nutDefect.textContent = localStats.Nut.defect;
+  if (nutGood) nutGood.textContent = localStats.Nut.good;
+  if (boltDetected) boltDetected.textContent = localStats.Bolt.detected;
+  if (boltDefect) boltDefect.textContent = localStats.Bolt.defect;
+  if (boltGood) boltGood.textContent = localStats.Bolt.good;
+  if (gearDetected) gearDetected.textContent = localStats.Gear.detected;
+  if (gearDefect) gearDefect.textContent = localStats.Gear.defect;
+  if (gearGood) gearGood.textContent = localStats.Gear.good;
   refreshAnalytics();
 }
 
 async function resetTotals() {
-  const res = await fetch(apiUrl('/reset_stats'), { method: 'POST' });
-  const data = await res.json();
-  if (!data.ok) return;
+  Object.keys(localStats).forEach(key => {
+    localStats[key] = { detected: 0, defect: 0, good: 0 };
+  });
+  localMeta.last_reset = todayIso();
+  saveLocalState();
   await refreshTotals();
 }
 
@@ -297,22 +635,39 @@ function renderCategoryChart(categories) {
 
 async function refreshAnalytics() {
   if (!trendChart && !categoryChart) return;
-  const res = await fetch(apiUrl('/analytics/summary'));
-  if (!res.ok) return;
-  const data = await res.json();
-  if (!data.ok) return;
-
-  if (analyticsTotalDetected) analyticsTotalDetected.textContent = data.totals.detected;
-  if (analyticsTotalDefect) analyticsTotalDefect.textContent = data.totals.defect;
+  const categories = localStats;
+  const totals = {
+    detected: Object.values(categories).reduce((a, v) => a + v.detected, 0),
+    defect: Object.values(categories).reduce((a, v) => a + v.defect, 0),
+    good: Object.values(categories).reduce((a, v) => a + v.good, 0)
+  };
+  if (analyticsTotalDetected) analyticsTotalDetected.textContent = totals.detected;
+  if (analyticsTotalDefect) analyticsTotalDefect.textContent = totals.defect;
   if (analyticsGoodRate) {
-    const rate = data.totals.detected > 0
-      ? ((data.totals.good / data.totals.detected) * 100).toFixed(1)
-      : '-';
+    const rate = totals.detected > 0 ? ((totals.good / totals.detected) * 100).toFixed(1) : '-';
     analyticsGoodRate.textContent = rate === '-' ? '-' : `${rate}%`;
   }
 
-  renderTrendChart(data.trend || []);
-  renderCategoryChart(data.categories || {});
+  const today = new Date();
+  const days = Array.from({ length: 7 }, (_, i) => {
+    const d = new Date(today);
+    d.setDate(today.getDate() - (6 - i));
+    return d.toISOString().slice(0, 10);
+  });
+  const trendMap = {};
+  days.forEach(d => {
+    trendMap[d] = { defect: 0, good: 0, detected: 0 };
+  });
+  localLog.forEach(row => {
+    if (!row.date || !trendMap[row.date]) return;
+    trendMap[row.date].defect += Number(row.defect || 0);
+    trendMap[row.date].good += Number(row.good || 0);
+    trendMap[row.date].detected += Number(row.detected || 0);
+  });
+  const trend = days.map(d => ({ date: d, ...trendMap[d] }));
+
+  renderTrendChart(trend);
+  renderCategoryChart(categories);
 }
 
 navItems.forEach(item => {
@@ -324,73 +679,93 @@ categoryChips.forEach(chip => {
 });
 
 async function startLive() {
-  if (!LIVE_SUPPORTED) {
-    alert('Live camera is not supported in this backend. Use image or video detection.');
+  if (!LIVE_SUPPORTED || !CLIENT_INFERENCE) {
+    alert('Live camera is not supported in this build.');
     return;
   }
   systemStatus.textContent = 'Live';
   liveSeries.length = 0;
   renderLiveChart();
   const thresholds = getThresholdSettings();
-  await fetch(apiUrl('/start_camera'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      category: selectedCategory,
-      conf: thresholds.conf,
-      iou: thresholds.iou,
-      label_mode: thresholds.labelMode
-    })
-  });
-  const src = apiUrl(`/video_feed?category=${encodeURIComponent(selectedCategory)}&ts=${Date.now()}`);
-  liveFeed.src = src;
-  liveFeedDashboard.src = src;
+  if (liveTimer) clearInterval(liveTimer);
+  if (liveStream) {
+    liveStream.getTracks().forEach(t => t.stop());
+  }
+  liveStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+  liveVideo = document.createElement('video');
+  liveVideo.srcObject = liveStream;
+  await liveVideo.play();
   showLivePreview();
-  if (livePolling) clearInterval(livePolling);
-  livePolling = setInterval(async () => {
-    const res = await fetch(apiUrl('/live_stats'));
-    if (!res.ok) return;
-    const data = await res.json();
-    if (!data.ok) return;
+  liveTimer = setInterval(async () => {
+    if (!liveVideo) return;
+    const result = await runDetectionOnImage(liveVideo, selectedCategory, thresholds.conf || 0.35, thresholds.iou || 0.45);
     const expected = Number(expectedInput.value || 0);
-    updateCurrentStats(data.category, data.detected, data.defect, data.good, expected);
+    const defect = result.defect;
+    const detected = result.detected;
+    const good = expected > 0 ? Math.max(expected - defect, 0) : Math.max(detected - defect, 0);
+    if (result.perCategory) {
+      const perCategory = {};
+      Object.entries(result.perCategory).forEach(([cat, vals]) => {
+        const catGood = expected > 0 ? Math.max(expected - vals.defect, 0) : Math.max(vals.detected - vals.defect, 0);
+        perCategory[cat] = { detected: vals.detected, defect: vals.defect, good: catGood };
+      });
+      updateLocalStatsMany(perCategory);
+    } else {
+      updateLocalStats(selectedCategory, detected, defect, good);
+    }
     const now = new Date();
+    appendLocalLog({
+      date: now.toISOString().slice(0, 10),
+      time: now.toTimeString().slice(0, 8),
+      category: selectedCategory,
+      expected_count: expected,
+      detected,
+      defect,
+      good
+    });
+    logSupabase({
+      timestamp: now.toISOString(),
+      category: selectedCategory,
+      expected_count: expected,
+      detected,
+      defect,
+      good
+    });
+    updateCurrentStats(selectedCategory, detected, defect, good, expected);
     liveSeries.push({
-      defect: Number(data.defect || 0),
+      defect: Number(defect || 0),
       label: now.toLocaleTimeString().slice(3, 8)
     });
     if (liveSeries.length > 60) liveSeries.shift();
     renderLiveChart();
-  }, 1000);
+    if (result.outputUrl) {
+      liveFeed.src = result.outputUrl;
+      liveFeedDashboard.src = result.outputUrl;
+    }
+  }, 900);
   isLive = true;
 }
 
 async function stopLive() {
-  if (!LIVE_SUPPORTED) {
-    return;
-  }
   systemStatus.textContent = 'Idle';
+  if (liveTimer) {
+    clearInterval(liveTimer);
+    liveTimer = null;
+  }
+  if (liveStream) {
+    liveStream.getTracks().forEach(t => t.stop());
+    liveStream = null;
+  }
+  if (liveVideo) {
+    liveVideo.pause();
+    liveVideo.srcObject = null;
+    liveVideo = null;
+  }
   liveFeed.src = '';
   liveFeedDashboard.src = '';
   if (liveFeedDashboard) liveFeedDashboard.classList.add('hidden');
-  if (livePolling) {
-    clearInterval(livePolling);
-    livePolling = null;
-  }
   isLive = false;
-  const expected = Number(expectedInput.value || 0);
-  const res = await fetch(apiUrl('/stop_camera'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ expected_count: expected })
-  });
-  const data = await res.json();
-  if (data.ok && data.output_url) {
-    showPreviewImage(data.output_url);
-    updateCurrentStats(data.category, data.detected, data.defect, data.good, expected);
-    await refreshTotals();
-    setActivePanel('dashboard');
-  }
+  await refreshTotals();
 }
 
 startCameraBtn.addEventListener('click', async () => {
@@ -414,109 +789,62 @@ stopCameraDashboardBtn.addEventListener('click', async () => {
 detectImageBtn.addEventListener('click', async () => {
   const fileInput = document.getElementById('imageFile');
   if (!fileInput.files.length) return;
-
+  if (!CLIENT_INFERENCE) return;
   systemStatus.textContent = 'Processing';
   const expected = Number(expectedInput.value || 0);
-  const form = new FormData();
-  form.append('image', fileInput.files[0]);
-  form.append('category', selectedCategory);
-  form.append('expected_count', expected);
   const thresholds = getThresholdSettings();
-  if (thresholds.conf !== null) form.append('conf', thresholds.conf);
-  if (thresholds.iou !== null) form.append('iou', thresholds.iou);
-  form.append('label_mode', thresholds.labelMode);
-
-  const res = await fetch(apiUrl('/detect_image'), { method: 'POST', body: form });
-  const data = await res.json();
+  const file = fileInput.files[0];
+  const img = new Image();
+  img.src = URL.createObjectURL(file);
+  await img.decode();
+  const result = await runDetectionOnImage(img, selectedCategory, thresholds.conf || 0.35, thresholds.iou || 0.45);
   systemStatus.textContent = 'Idle';
-
-  if (data.ok) {
-    showPreviewImage(data.output_url);
-    updateCurrentStats(data.category, data.detected, data.defect, data.good, expected);
-    await refreshTotals();
-    setActivePanel('dashboard');
-  }
+  await applyDetectionResult(result, selectedCategory, expected);
 });
 
 detectVideoBtn.addEventListener('click', async () => {
   const fileInput = document.getElementById('videoFile');
   if (!fileInput.files.length) return;
-
+  if (!CLIENT_INFERENCE) return;
   systemStatus.textContent = 'Processing';
   const expected = Number(expectedInput.value || 0);
-  const form = new FormData();
-  form.append('video', fileInput.files[0]);
-  form.append('category', selectedCategory);
-  form.append('expected_count', expected);
-
-  const res = await fetch(apiUrl('/detect_video'), { method: 'POST', body: form });
-  const data = await res.json();
+  const thresholds = getThresholdSettings();
+  const file = fileInput.files[0];
+  const video = document.createElement('video');
+  video.src = URL.createObjectURL(file);
+  await new Promise(resolve => {
+    video.onloadeddata = () => resolve();
+  });
+  video.currentTime = 0;
+  await new Promise(resolve => {
+    video.onseeked = () => resolve();
+  });
+  const result = await runDetectionOnImage(video, selectedCategory, thresholds.conf || 0.35, thresholds.iou || 0.45);
   systemStatus.textContent = 'Idle';
-
-  if (data.ok) {
-    showPreviewVideo(data.output_url);
-    updateCurrentStats(data.category, data.detected, data.defect, data.good, expected);
-    await refreshTotals();
-    setActivePanel('dashboard');
-  }
+  await applyDetectionResult(result, selectedCategory, expected);
 });
 
 function handleUploadFile(file) {
   if (!file) return;
+  if (!CLIENT_INFERENCE) return;
   uploadFileName.textContent = file.name;
-  uploadProgressBar.style.width = '0%';
-  uploadStatus.textContent = 'Uploading...';
+  uploadProgressBar.style.width = '100%';
+  uploadStatus.textContent = 'Processing...';
   systemStatus.textContent = 'Processing';
-
   const expected = Number(expectedInput.value || 0);
-  const form = new FormData();
-  form.append('file', file);
-  form.append('category', selectedCategory);
-  form.append('expected_count', expected);
   const thresholds = getThresholdSettings();
-  if (thresholds.conf !== null) form.append('conf', thresholds.conf);
-  if (thresholds.iou !== null) form.append('iou', thresholds.iou);
-  form.append('label_mode', thresholds.labelMode);
-
-  const xhr = new XMLHttpRequest();
-  xhr.open('POST', apiUrl('/upload'), true);
-
-  xhr.upload.onprogress = (event) => {
-    if (event.lengthComputable) {
-      const percent = Math.round((event.loaded / event.total) * 100);
-      uploadProgressBar.style.width = `${percent}%`;
-      uploadStatus.textContent = `Uploading... ${percent}%`;
-    }
-  };
-
-  xhr.onload = async () => {
+  const img = new Image();
+  img.src = URL.createObjectURL(file);
+  img.onload = async () => {
+    const result = await runDetectionOnImage(img, selectedCategory, thresholds.conf || 0.35, thresholds.iou || 0.45);
     systemStatus.textContent = 'Idle';
-    if (xhr.status !== 200) {
-      uploadStatus.textContent = 'Upload failed';
-      return;
-    }
-    const data = JSON.parse(xhr.responseText || '{}');
-    if (!data.ok) {
-      uploadStatus.textContent = data.error || 'Upload failed';
-      return;
-    }
-    uploadStatus.textContent = 'Upload complete';
-    if (data.output_url.endsWith('.mp4')) {
-      showPreviewVideo(data.output_url);
-    } else {
-      showPreviewImage(data.output_url);
-    }
-    updateCurrentStats(data.category, data.detected, data.defect, data.good, expected);
-    await refreshTotals();
-    setActivePanel('dashboard');
+    uploadStatus.textContent = 'Done';
+    await applyDetectionResult(result, selectedCategory, expected);
   };
-
-  xhr.onerror = () => {
+  img.onerror = () => {
     systemStatus.textContent = 'Idle';
-    uploadStatus.textContent = 'Upload failed';
+    uploadStatus.textContent = 'Failed to load image';
   };
-
-  xhr.send(form);
 }
 
 async function handleSampleClick(url) {
@@ -565,28 +893,23 @@ uploadDrop.addEventListener('drop', (event) => {
 detectImageUrlBtn.addEventListener('click', async () => {
   const url = imageUrlInput.value.trim();
   if (!url) return;
+  if (!CLIENT_INFERENCE) return;
   systemStatus.textContent = 'Processing';
   const expected = Number(expectedInput.value || 0);
-
-  const res = await fetch(apiUrl('/detect_image_url'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      url,
-      category: selectedCategory,
-      expected_count: expected,
-      conf: (confidenceSlider ? Number(confidenceSlider.value || 50) / 100 : null),
-      iou: (overlapSlider ? Number(overlapSlider.value || 50) / 100 : null),
-      label_mode: (labelModeSelect ? labelModeSelect.value : 'confidence')
-    })
-  });
-  const data = await res.json();
-  systemStatus.textContent = 'Idle';
-  if (data.ok) {
-    showPreviewImage(data.output_url);
-    updateCurrentStats(data.category, data.detected, data.defect, data.good, expected);
-    await refreshTotals();
-    setActivePanel('dashboard');
+  const thresholds = getThresholdSettings();
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('Failed to load image');
+    const blob = await res.blob();
+    const img = new Image();
+    img.src = URL.createObjectURL(blob);
+    await img.decode();
+    const result = await runDetectionOnImage(img, selectedCategory, thresholds.conf || 0.35, thresholds.iou || 0.45);
+    systemStatus.textContent = 'Idle';
+    await applyDetectionResult(result, selectedCategory, expected);
+  } catch {
+    systemStatus.textContent = 'Idle';
+    uploadStatus.textContent = 'Failed to load image URL (CORS?)';
   }
 });
 
@@ -600,15 +923,15 @@ const bindSampleImageClicks = (images) => {
 if (sampleImages.length) {
   bindSampleImageClicks(Array.from(sampleImages));
 } else if (sampleRow) {
-  fetch(apiUrl('/samples-json'))
+  fetch('/images/index.json')
     .then(res => res.json())
-    .then(data => {
-      if (!data.ok || !Array.isArray(data.images) || data.images.length === 0) {
+    .then(images => {
+      if (!Array.isArray(images) || images.length === 0) {
         sampleRow.innerHTML = '<div class="sample-empty">No samples found in images/</div>';
         return;
       }
       sampleRow.innerHTML = '';
-      data.images.slice(0, 10).forEach(item => {
+      images.slice(0, 10).forEach(item => {
         const img = document.createElement('img');
         img.src = normalizeUrl(item.url);
         img.alt = item.name || 'sample';
@@ -622,33 +945,172 @@ if (sampleImages.length) {
     });
 }
 
-downloadReport.addEventListener('click', () => {
-  window.open(apiUrl('/report/latest'), '_blank');
-});
+if (downloadReport) {
+  downloadReport.addEventListener('click', () => {
+    if (!localLog.length) {
+      alert('No detections logged yet. Run a detection first.');
+      return;
+    }
+    downloadCsv(localLog, `defect-report-${todayIso()}.csv`);
+  });
+}
 
-downloadReportSecondary.addEventListener('click', () => {
-  window.open(apiUrl('/report/latest'), '_blank');
-});
+if (downloadReportSecondary) {
+  downloadReportSecondary.addEventListener('click', () => {
+    if (!localLog.length) {
+      alert('No detections logged yet. Run a detection first.');
+      return;
+    }
+    downloadCsv(localLog, `defect-report-${todayIso()}.csv`);
+  });
+}
 
-function buildReportDateQuery() {
-  if (!reportDate || !reportDate.value) return '';
-  return `?date=${encodeURIComponent(reportDate.value)}`;
+function escapeCsvValue(value) {
+  if (value === null || value === undefined) return '';
+  const str = String(value);
+  if (/[",\n]/.test(str)) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+}
+
+function buildCsv(rows) {
+  const header = ['timestamp', 'date', 'time', 'category', 'expected_count', 'detected', 'defect', 'good'];
+  const lines = [header.join(',')];
+  rows.forEach(row => {
+    const timestamp = row.timestamp || (row.date && row.time ? `${row.date}T${row.time}` : row.date || '');
+    const line = [
+      timestamp,
+      row.date || '',
+      row.time || '',
+      row.category || '',
+      row.expected_count ?? '',
+      row.detected ?? '',
+      row.defect ?? '',
+      row.good ?? ''
+    ].map(escapeCsvValue).join(',');
+    lines.push(line);
+  });
+  return lines.join('\n');
+}
+
+function downloadCsv(rows, filename) {
+  const csv = buildCsv(rows);
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function getReportDate() {
+  return reportDate && reportDate.value ? reportDate.value : todayIso();
+}
+
+function filterLogByDate(date) {
+  return localLog.filter(row => row.date === date);
+}
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, char => {
+    const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+    return map[char] || char;
+  });
+}
+
+function openPrintableReport(rows, dateLabel) {
+  const win = window.open('', '_blank');
+  if (!win) {
+    alert('Popup blocked. Please allow popups to print the report.');
+    return;
+  }
+  const tableRows = rows.map(row => `
+    <tr>
+      <td>${escapeHtml(row.timestamp || '')}</td>
+      <td>${escapeHtml(row.date || '')}</td>
+      <td>${escapeHtml(row.time || '')}</td>
+      <td>${escapeHtml(row.category || '')}</td>
+      <td>${escapeHtml(row.expected_count ?? '')}</td>
+      <td>${escapeHtml(row.detected ?? '')}</td>
+      <td>${escapeHtml(row.defect ?? '')}</td>
+      <td>${escapeHtml(row.good ?? '')}</td>
+    </tr>
+  `).join('');
+  const html = `
+    <!doctype html>
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <title>Defect Report ${escapeHtml(dateLabel)}</title>
+        <style>
+          body { font-family: Arial, sans-serif; padding: 24px; }
+          h1 { font-size: 20px; margin: 0 0 12px; }
+          table { width: 100%; border-collapse: collapse; font-size: 12px; }
+          th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; }
+          th { background: #f4f4f4; }
+        </style>
+      </head>
+      <body>
+        <h1>Defect Report - ${escapeHtml(dateLabel)}</h1>
+        <table>
+          <thead>
+            <tr>
+              <th>Timestamp</th>
+              <th>Date</th>
+              <th>Time</th>
+              <th>Category</th>
+              <th>Expected</th>
+              <th>Detected</th>
+              <th>Defect</th>
+              <th>Good</th>
+            </tr>
+          </thead>
+          <tbody>${tableRows}</tbody>
+        </table>
+      </body>
+    </html>
+  `;
+  win.document.write(html);
+  win.document.close();
+  win.focus();
+  win.print();
 }
 
 if (downloadDailyExcel) {
   downloadDailyExcel.addEventListener('click', () => {
-    window.open(apiUrl(`/report/daily.xlsx${buildReportDateQuery()}`), '_blank');
+    const date = getReportDate();
+    const rows = filterLogByDate(date);
+    if (!rows.length) {
+      alert(`No detections found for ${date}.`);
+      return;
+    }
+    downloadCsv(rows, `defect-report-${date}.csv`);
   });
 }
 
 if (downloadDailyPdf) {
   downloadDailyPdf.addEventListener('click', () => {
-    window.open(apiUrl(`/report/daily.pdf${buildReportDateQuery()}`), '_blank');
+    const date = getReportDate();
+    const rows = filterLogByDate(date);
+    if (!rows.length) {
+      alert(`No detections found for ${date}.`);
+      return;
+    }
+    openPrintableReport(rows, date);
   });
+}
+
+if (reportDate && !reportDate.value) {
+  reportDate.value = todayIso();
 }
 
 setActivePanel('dashboard');
 refreshTotals();
+initSupabaseClient();
 
 if (confidenceSlider && confidenceValue) {
   confidenceSlider.addEventListener('input', () => {
@@ -663,27 +1125,6 @@ if (overlapSlider && overlapValue) {
   });
   overlapValue.textContent = `${overlapSlider.value}%`;
 }
-
-async function initSupabaseClient() {
-  if (!window.SUPABASE_URL || !window.SUPABASE_ANON_KEY) return;
-  try {
-    const { createClient } = await import('https://cdn.jsdelivr.net/npm/@supabase/supabase-js/+esm');
-    window.supabase = createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY, {
-      auth: { persistSession: false }
-    });
-    const { error } = await window.supabase
-      .from('detections')
-      .select('id')
-      .limit(1);
-    if (error) {
-      console.warn('Supabase read failed:', error.message);
-    }
-  } catch (err) {
-    console.warn('Supabase init failed:', err.message);
-  }
-}
-
-initSupabaseClient();
 
 const urlParams = new URLSearchParams(window.location.search);
 const sampleParam = urlParams.get('sample');
